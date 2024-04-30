@@ -1,18 +1,19 @@
-import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
+import * as cr from 'aws-cdk-lib/custom-resources';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as events from 'aws-cdk-lib/aws-events';
-import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
+import * as path from 'path';
 import * as rds from 'aws-cdk-lib/aws-rds';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
-import * as cr from 'aws-cdk-lib/custom-resources';
-import { Construct } from 'constructs';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
 
-const excludeCharacters = '%+~`#$&*()|[]{}:;<>?!\'/@\"\\=^,'; // for Password
+import { Construct } from 'constructs';
+import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
+
+const excludeCharacters = '%+~`#$&*()|[]{}:;<>?!\'/@"\\=^,'; // for Password
 
 interface SupabaseDatabaseProps {
   vpc: ec2.IVpc;
@@ -36,7 +37,9 @@ export class SupabaseDatabase extends Construct {
     const { vpc, highAvailability } = props;
 
     /** Database Engine */
-    const engine = rds.DatabaseClusterEngine.auroraPostgres({ version: rds.AuroraPostgresEngineVersion.of('15.4', '15') });
+    const engine = rds.DatabaseClusterEngine.auroraPostgres({
+      version: rds.AuroraPostgresEngineVersion.of('15.4', '15')
+    });
 
     /** Parameter Group */
     const parameterGroup = new rds.ParameterGroup(this, 'ParameterGroup', {
@@ -44,10 +47,11 @@ export class SupabaseDatabase extends Construct {
       description: 'Parameter group for Supabase',
       parameters: {
         'rds.force_ssl': '0',
-        'shared_preload_libraries': 'pg_tle, pg_stat_statements, pgaudit, pg_cron',
+        shared_preload_libraries:
+          'pg_tle, pg_stat_statements, pgaudit, pg_cron',
         'rds.logical_replication': '1',
-        'max_slot_wal_keep_size': '1024', // https://github.com/supabase/realtime
-      },
+        max_slot_wal_keep_size: '1024' // https://github.com/supabase/realtime
+      }
     });
 
     this.cluster = new rds.DatabaseCluster(this, 'Cluster', {
@@ -55,19 +59,27 @@ export class SupabaseDatabase extends Construct {
       engine,
       parameterGroup,
       vpc,
-      writer: rds.ClusterInstance.serverlessV2('Instance1'),
+      writer: rds.ClusterInstance.serverlessV2('Instance1', {
+        publiclyAccessible: true
+      }),
       readers: [
-        rds.ClusterInstance.serverlessV2('Instance2', { scaleWithWriter: true }),
+        rds.ClusterInstance.serverlessV2('Instance2', {
+          publiclyAccessible: true,
+          scaleWithWriter: true
+        })
       ],
       credentials: rds.Credentials.fromGeneratedSecret('supabase_admin', {
-        secretName: `${cdk.Aws.STACK_NAME}-${id}-supabase_admin`,
+        secretName: `${cdk.Aws.STACK_NAME}-${id}-supabase_admin`
       }),
       defaultDatabaseName: 'postgres',
       storageEncrypted: true,
+      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC }
     });
 
-    const instance1 = this.cluster.node.findChild('Instance1').node.defaultChild as rds.CfnDBInstance;
-    const instance2 = this.cluster.node.findChild('Instance2').node.defaultChild as rds.CfnDBInstance;
+    const instance1 = this.cluster.node.findChild('Instance1').node
+      .defaultChild as rds.CfnDBInstance;
+    const instance2 = this.cluster.node.findChild('Instance2').node
+      .defaultChild as rds.CfnDBInstance;
 
     if (typeof highAvailability !== 'undefined') {
       instance2.cfnOptions.condition = highAvailability;
@@ -78,9 +90,7 @@ export class SupabaseDatabase extends Construct {
       description: 'Supabase - Database migration function',
       entry: path.resolve(__dirname, 'cr-migrations-handler.ts'),
       bundling: {
-        nodeModules: [
-          '@databases/pg',
-        ],
+        nodeModules: ['@databases/pg'],
         commandHooks: {
           beforeInstall: (_inputDir, _outputDir) => {
             return [];
@@ -89,18 +99,16 @@ export class SupabaseDatabase extends Construct {
             return [];
           },
           afterBundling: (inputDir, outputDir) => {
-            return [
-              `cp -rp ${inputDir}/src/supabase-db/sql/* ${outputDir}/`,
-            ];
-          },
-        },
+            return [`cp -rp ${inputDir}/src/supabase-db/sql/* ${outputDir}/`];
+          }
+        }
       },
       runtime: lambda.Runtime.NODEJS_20_X,
       timeout: cdk.Duration.seconds(60),
       environment: {
-        DB_SECRET_ARN: this.cluster.secret!.secretArn,
+        DB_SECRET_ARN: this.cluster.secret!.secretArn
       },
-      vpc,
+      vpc
     });
 
     // Allow a function to connect to database
@@ -110,54 +118,62 @@ export class SupabaseDatabase extends Construct {
     this.cluster.secret?.grantRead(migrationFunction);
 
     /** Custom resource provider for database migration */
-    const migrationProvider = new cr.Provider(this, 'MigrationProvider', { onEventHandler: migrationFunction });
+    const migrationProvider = new cr.Provider(this, 'MigrationProvider', {
+      onEventHandler: migrationFunction
+    });
 
     /** Database migration */
     this.migration = new cdk.CustomResource(this, 'Migration', {
       serviceToken: migrationProvider.serviceToken,
       resourceType: 'Custom::DatabaseMigration',
       properties: {
-        Fingerprint: cdk.FileSystem.fingerprint(path.resolve(__dirname, 'sql')),
-      },
+        Fingerprint: cdk.FileSystem.fingerprint(path.resolve(__dirname, 'sql'))
+      }
     });
 
     // Wait until the database is ready.
     this.migration.node.addDependency(instance1);
 
     /** Custom resource handler to modify db user password */
-    const userPasswordFunction = new NodejsFunction(this, 'UserPasswordFunction', {
-      description: 'Supabase - DB user password function',
-      entry: path.resolve(__dirname, 'cr-user-password-handler.ts'),
-      bundling: {
-        nodeModules: ['@databases/pg'],
-      },
-      runtime: lambda.Runtime.NODEJS_20_X,
-      timeout: cdk.Duration.seconds(10),
-      environment: {
-        DB_SECRET_ARN: this.cluster.secret!.secretArn,
-      },
-      initialPolicy: [
-        new iam.PolicyStatement({
-          actions: [
-            'secretsmanager:GetSecretValue',
-            'secretsmanager:PutSecretValue',
-          ],
-          resources: [`arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:${cdk.Aws.STACK_NAME}-${id}-*`],
-        }),
-        new iam.PolicyStatement({
-          notActions: [
-            'secretsmanager:PutSecretValue',
-          ],
-          resources: [this.cluster.secret!.secretArn],
-        }),
-      ],
-      vpc,
-    });
+    const userPasswordFunction = new NodejsFunction(
+      this,
+      'UserPasswordFunction',
+      {
+        description: 'Supabase - DB user password function',
+        entry: path.resolve(__dirname, 'cr-user-password-handler.ts'),
+        bundling: {
+          nodeModules: ['@databases/pg']
+        },
+        runtime: lambda.Runtime.NODEJS_20_X,
+        timeout: cdk.Duration.seconds(10),
+        environment: {
+          DB_SECRET_ARN: this.cluster.secret!.secretArn
+        },
+        initialPolicy: [
+          new iam.PolicyStatement({
+            actions: [
+              'secretsmanager:GetSecretValue',
+              'secretsmanager:PutSecretValue'
+            ],
+            resources: [
+              `arn:aws:secretsmanager:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:secret:${cdk.Aws.STACK_NAME}-${id}-*`
+            ]
+          }),
+          new iam.PolicyStatement({
+            notActions: ['secretsmanager:PutSecretValue'],
+            resources: [this.cluster.secret!.secretArn]
+          })
+        ],
+        vpc
+      }
+    );
 
     // Allow a function to connect to database
     userPasswordFunction.connections.allowToDefaultPort(this.cluster);
 
-    this.userPasswordProvider = new cr.Provider(this, 'UserPasswordProvider', { onEventHandler: userPasswordFunction });
+    this.userPasswordProvider = new cr.Provider(this, 'UserPasswordProvider', {
+      onEventHandler: userPasswordFunction
+    });
   }
 
   /** Generate and set password to database user */
@@ -172,8 +188,8 @@ export class SupabaseDatabase extends Construct {
       generateSecretString: {
         excludePunctuation: true,
         secretStringTemplate: JSON.stringify({ username }),
-        generateStringKey: 'password',
-      },
+        generateStringKey: 'password'
+      }
     });
 
     /** Modify password job */
@@ -182,8 +198,8 @@ export class SupabaseDatabase extends Construct {
       resourceType: 'Custom::DatabaseUserPassword',
       properties: {
         Username: username,
-        SecretId: secret.secretArn,
-      },
+        SecretId: secret.secretArn
+      }
     });
 
     // Wait until the database migration is complete.
@@ -192,5 +208,4 @@ export class SupabaseDatabase extends Construct {
 
     return secret;
   }
-
 }

@@ -3,13 +3,17 @@ import { BootstraplessStackSynthesizer } from 'cdk-bootstrapless-synthesizer';
 import { SupabaseStack } from './supabase-stack';
 import { SupabaseWafStack } from './supabase-waf-stack';
 
-const isCfnPublishing: boolean = typeof process.env.BSS_FILE_ASSET_BUCKET_NAME != 'undefined';
+const isCfnPublishing: boolean =
+  typeof process.env.BSS_FILE_ASSET_BUCKET_NAME != 'undefined';
 
-const env = (isCfnPublishing)
+const env = isCfnPublishing
   ? undefined
-  : { account: process.env.CDK_DEFAULT_ACCOUNT, region: process.env.CDK_DEFAULT_REGION };
+  : {
+      account: process.env.CDK_DEFAULT_ACCOUNT,
+      region: process.env.CDK_DEFAULT_REGION
+    };
 
-const synthesizer = (isCfnPublishing)
+const synthesizer = isCfnPublishing
   ? new BootstraplessStackSynthesizer()
   : undefined;
 
